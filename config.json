@@ -1,0 +1,24 @@
+{
+  "check_in": "2026-12-14",
+  "check_out": "2026-12-16",
+  "houses": [
+    "110/3",
+    "110/4",
+    "111/2"
+  ],
+  "max_houses": 3,
+  "accept_any_summit_house": false,
+  "open_date": "auto",
+  "open_times": [
+    "00:00",
+    "09:00"
+  ],
+  "poll_from_minutes_before": 2,
+  "poll_for_minutes_after": 20,
+  "poll_every_seconds": 1,
+  "idle_poll_seconds": 3,
+  "keep_grabbing_seconds": 45,
+  "give_up_at": "12:00",
+  "book_for": "",
+  "pay_method": "bank"
+}
