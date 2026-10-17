@@ -17,7 +17,7 @@ const TOKEN = crypto.randomBytes(16).toString('hex');
 const readJson = (f, dflt) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return dflt; } };
 
 // ---------- bot process ----------
-let bot = null, botMode = '', caffeinate = null;
+let bot = null, botMode = '', botDates = '', caffeinate = null;
 const lines = [];
 const clients = new Set();
 
@@ -27,13 +27,27 @@ function emit(text, kind = 'log') {
   if (lines.length > 800) lines.shift();
   for (const res of clients) res.write(`data: ${JSON.stringify(line)}\n\n`);
 }
-const state = () => ({ running: !!bot, mode: botMode });
+const state = () => ({ running: !!bot, mode: botMode, dates: botDates });
+const datesOf = c => `${c.check_in} → ${c.check_out}`;
+
+// Same limits bot.mjs enforces, checked on save so a bad value can't stop the bot at start time.
+function configError(c) {
+  const ymd = /^\d{4}-\d{2}-\d{2}$/;
+  if (!ymd.test(c.check_in || '') || !ymd.test(c.check_out || '')) return 'Set both check-in and check-out dates.';
+  const nights = (Date.parse(c.check_out) - Date.parse(c.check_in)) / 864e5;
+  if (!(nights >= 1 && nights <= 3)) return `Check-in to check-out is ${nights} nights; the site allows 1–3 per booking.`;
+  if (!Array.isArray(c.houses) || (!c.houses.length && !c.accept_any_summit_house)) return 'List at least one house.';
+  if (!(Number.isInteger(c.max_houses) && c.max_houses >= 1)) return 'How many houses must be a whole number, at least 1.';
+  if (!(c.poll_every_seconds >= 1) || !(c.idle_poll_seconds >= 1)) return 'Check intervals must be at least 1 second.';
+  return '';
+}
 const pushState = () => { for (const res of clients) res.write(`event: state\ndata: ${JSON.stringify(state())}\n\n`); };
 
 function startBot(mode, extra = []) {
   if (bot) throw new Error(`The bot is already running (${botMode}). Stop it first.`);
   bot = spawn(process.execPath, ['bot.mjs', mode, ...extra], { cwd: DIR, stdio: ['pipe', 'pipe', 'pipe'] });
   botMode = mode + (extra.length ? ' ' + extra.join(' ') : '');
+  botDates = datesOf(readJson(CONFIG, {}));   // the bot reads config.json once, at start
   caffeinate = spawn('caffeinate', ['-i', '-w', String(bot.pid)], { stdio: 'ignore' }); // keep the Mac awake
   emit(`── started: ${botMode} ──`, 'sys');
   for (const stream of [bot.stdout, bot.stderr]) {
@@ -46,7 +60,7 @@ function startBot(mode, extra = []) {
   }
   bot.on('exit', code => {
     emit(`── stopped: ${botMode} (exit ${code ?? 'killed'}) ──`, 'sys');
-    bot = null; botMode = ''; caffeinate?.kill(); pushState();
+    bot = null; botMode = ''; botDates = ''; caffeinate?.kill(); pushState();
   });
   pushState();
 }
@@ -78,8 +92,12 @@ http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/config' && req.method === 'POST') {
       const cfg = { ...readJson(CONFIG, {}), ...(await body(req)) };
+      const err = configError(cfg);
+      if (err) return send(res, 400, { error: err });
       fs.writeFileSync(CONFIG, JSON.stringify(cfg, null, 2) + '\n');
-      emit('Settings saved.', 'sys');
+      const stale = bot && botDates !== datesOf(cfg);
+      emit(stale ? `Settings saved. The running bot is still using ${botDates} – Stop and Start it to use ${datesOf(cfg)}.`
+                 : bot ? 'Settings saved. The running bot keeps its old settings until you restart it.' : 'Settings saved.', 'sys');
       return send(res, 200, { ok: true });
     }
     if (url.pathname === '/api/creds' && req.method === 'POST') {
@@ -98,7 +116,12 @@ http.createServer(async (req, res) => {
       return send(res, 200, { ok: true });
     }
     if (url.pathname === '/api/stop' && req.method === 'POST') {
-      if (bot) { emit('Stopping…', 'sys'); bot.kill('SIGTERM'); }
+      if (bot) {
+        emit('Stopping…', 'sys');
+        const b = bot; b.kill('SIGTERM');
+        // Last resort if it doesn't exit; normally it closes Chrome and exits within a few seconds.
+        setTimeout(() => { if (b.exitCode === null && b.signalCode === null) { emit('Bot did not stop – forcing it.', 'sys'); b.kill('SIGKILL'); } }, 15000);
+      }
       return send(res, 200, { ok: true });
     }
     if (url.pathname === '/api/finish' && req.method === 'POST') {
@@ -208,39 +231,61 @@ const $ = id => document.getElementById(id);
 const fields = ['check_in','check_out','max_houses','pay_method','book_for','poll_every_seconds','idle_poll_seconds'];
 const nums = ['max_houses','poll_every_seconds','idle_poll_seconds'];
 
+let openDateSetting = 'auto';
+const addDays = (ymd, n) => new Date(Date.parse(ymd + 'T00:00:00Z') + n * 864e5).toISOString().slice(0, 10);
 function showOpens() {
   const ci = $('check_in').value, co = $('check_out').value;
   if (!ci) return $('opens').textContent = '';
-  const open = new Date(Date.parse(ci + 'T00:00:00Z') - 59 * 864e5);
+  const open = openDateSetting === 'auto' ? addDays(ci, -59) : openDateSetting;
   const nights = co ? (Date.parse(co) - Date.parse(ci)) / 864e5 : 0;
-  const fmt = d => d.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
-  $('opens').innerHTML = 'Booking opens <b>' + fmt(open) + '</b> (probably 00:00 Bangkok) · ' +
+  const fmt = ymd => new Date(ymd + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' });
+  $('opens').innerHTML = 'Booking opens <b>' + fmt(open) + '</b> (around 00:00–00:10 Bangkok)' +
+    (openDateSetting === 'auto' ? '' : ' <span style="color:var(--warn)">– fixed by open_date in config.json, not by check-in</span>') + ' · ' +
     (nights >= 1 && nights <= 3 ? nights + ' night' + (nights > 1 ? 's' : '') : '<span style="color:var(--warn)">stay must be 1–3 nights</span>');
 }
-['check_in','check_out'].forEach(id => $(id).addEventListener('input', showOpens));
+// Keep check-out 1–3 nights after check-in, so moving check-in doesn't leave an impossible stay behind.
+function syncCheckOut() {
+  const ci = $('check_in').value, co = $('check_out');
+  if (!ci) return;
+  co.min = addDays(ci, 1); co.max = addDays(ci, 3);
+  if (!co.value || co.value < co.min || co.value > co.max) co.value = co.min;
+}
+$('check_in').addEventListener('input', () => { syncCheckOut(); showOpens(); });
+$('check_out').addEventListener('input', showOpens);
 
+const credState = saved => $('credState').textContent = saved ? '· saved ✓' : '· not saved';
 async function load() {
   const { config: c, credsSaved } = await api('/api/config');
   fields.forEach(f => { if (c[f] !== undefined) $(f).value = c[f]; });
   $('houses').value = (c.houses || []).join(', ');
-  $('credState').textContent = credsSaved ? '· saved ✓' : '· not saved';
+  openDateSetting = c.open_date || 'auto';
+  credState(credsSaved);
+  if ($('check_in').value) { $('check_out').min = addDays($('check_in').value, 1); $('check_out').max = addDays($('check_in').value, 3); }
   showOpens();
 }
 $('saveCfg').onclick = async () => {
   const cfg = {}; fields.forEach(f => cfg[f] = nums.includes(f) ? Number($(f).value) : $(f).value);
   cfg.houses = $('houses').value.split(/[\\s,]+/).filter(Boolean);
-  await api('/api/config', cfg);
+  const r = await api('/api/config', cfg);
+  if (r.error) alert('Not saved: ' + r.error);
 };
 $('saveCreds').onclick = async () => {
-  await api('/api/creds', { id_card: $('id_card').value.trim(), password: $('password').value });
-  $('id_card').value = ''; $('password').value = ''; load();
+  const r = await api('/api/creds', { id_card: $('id_card').value.trim(), password: $('password').value });
+  if (r.error) return alert('Not saved: ' + r.error);
+  // Only refresh the login status: a full load() would wipe unsaved edits in the Booking card.
+  $('id_card').value = ''; $('password').value = '';
+  credState((await api('/api/config')).credsSaved);
 };
 document.querySelectorAll('[data-mode]').forEach(b => b.onclick = async () => {
   if (b.dataset.mode === 'run' && !confirm('Start the real bot? It will put houses in your cart when they appear.')) return;
   $('banner').style.display = 'none';
   const r = await api('/api/start', { mode: b.dataset.mode }); if (r.error) alert(r.error);
 });
-$('stop').onclick = () => api('/api/stop', {});
+$('stop').onclick = () => {
+  if ($('banner').style.display === 'block' &&
+      !confirm('Houses are in the cart. Stopping closes the bot\\'s Chrome window – only do this after you have pressed บันทึก. Stop now?')) return;
+  api('/api/stop', {});
+};
 $('finish').onclick = () => api('/api/finish', {});
 
 const log = $('log');
@@ -257,7 +302,8 @@ es.onmessage = e => {
 };
 es.addEventListener('state', e => {
   const s = JSON.parse(e.data);
-  $('status').innerHTML = '<span class="dot' + (s.running ? ' on' : '') + '"></span>' + (s.running ? 'Running: <b>' + s.mode + '</b>' : 'Idle');
+  $('status').innerHTML = '<span class="dot' + (s.running ? ' on' : '') + '"></span>' + (s.running ? 'Running: <b>' + s.mode + '</b> · ' + s.dates : 'Idle');
+  if (!s.running) $('banner').style.display = 'none';
   document.querySelectorAll('[data-mode]').forEach(b => b.disabled = s.running);
   $('stop').disabled = $('finish').disabled = !s.running;
 });

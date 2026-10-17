@@ -77,6 +77,10 @@ if (!(nights >= 1 && nights <= 3)) {
   console.error(`check_in → check_out is ${nights} nights. The site allows 1–3 nights per booking.`);
   process.exit(1);
 }
+if (!(cfg.max_houses >= 1) || !(cfg.poll_every_seconds > 0) || !(cfg.idle_poll_seconds > 0)) {
+  console.error('max_houses, poll_every_seconds and idle_poll_seconds must all be at least 1.');
+  process.exit(1);
+}
 const openDate = cfg.open_date === 'auto' ? addDays(cfg.check_in, -BOOKING_WINDOW_DAYS) : cfg.open_date;
 
 // "ภูกระดึง 111/1 (หยาดน้ำค้าง)" -> "111/1"
@@ -88,13 +92,27 @@ const wantRank = h => {
 
 // ---------- browser ----------
 const profile = process.argv[2] === 'watch' ? '.chrome-profile-watch' : '.chrome-profile';
+// Playwright's own SIGTERM/SIGHUP handlers close Chrome but leave this process running (it then loops on
+// "Target page closed" errors), so we handle those signals ourselves: close Chrome, then exit.
 const ctx = await chromium.launchPersistentContext(path.join(DIR, profile), {
-  channel: 'chrome', headless: false, viewport: null,
+  channel: 'chrome', headless: false, viewport: null, handleSIGTERM: false, handleSIGHUP: false,
 });
+let closing = false;
+async function shutdown(code = 0) {
+  if (closing) return;
+  closing = true;
+  setTimeout(() => process.exit(code), 8000).unref();   // Chrome is killed on exit anyway
+  await ctx.close().catch(() => {});
+  process.exit(code);
+}
+process.on('SIGTERM', () => { log('Stopping – closing the bot window.'); shutdown(); });
+process.on('SIGHUP', () => shutdown());
+
 const page = ctx.pages()[0] || await ctx.newPage();
 panelPage = page;
 page.on('load', showPanel);   // redraw the log panel after every page load
 page.on('dialog', d => d.accept().catch(() => {}));
+page.on('close', () => { if (!closing) { log('The bot\'s Chrome window was closed – stopping.'); shutdown(); } });
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
 // Closes the announcement popup (and the first-visit popup) and stops them reopening on this page.
@@ -128,17 +146,28 @@ async function openReservation() {
   await dismissPopups();
 }
 
+// Reloads the page if it has lost jQuery (error page, failed load), which every site call needs.
+async function ensurePageUsable() {
+  if (await page.evaluate(() => !!(window.$ && window.$.ajax)).catch(() => false)) return;
+  log('  page is not usable – reloading it');
+  try { await openReservation(); } catch (e) { log('  reload failed:', e.message.split('\n')[0]); await sleep(3000); }
+}
+
 async function loggedIn() {
   // Logged out, the #menu_member toggle reads "เข้าสู่ระบบ"; logged in, it shows the member's name.
+  // This reads the page as it was when it loaded, so reload first if the login may have expired since.
+  await page.waitForSelector('#menu_member > a.dropdown-toggle', { timeout: 10000 }).catch(() => {});
   return page.evaluate(() => {
     const t = document.querySelector('#menu_member > a.dropdown-toggle');
     return !!t && !/เข้าสู่ระบบ/.test(t.getAttribute('title') + t.innerText);
-  });
+  }).catch(() => false);
 }
 
 // Fills the login form from credentials, then waits for you to tick the reCAPTCHA
 // (the site keeps the login button disabled until you do) and presses login.
-async function ensureLoggedIn() {
+// fresh: reload first, because the site just said we are logged out and the open page still shows the old menu.
+async function ensureLoggedIn({ fresh = false } = {}) {
+  if (fresh) await openReservation();
   if (await loggedIn()) return true;
   await gotoRetry(`${SITE}/member.php`);
   await dismissPopups();
@@ -160,7 +189,7 @@ async function ensureLoggedIn() {
   } catch { log('Login not completed within 5 minutes.'); }
   await openReservation();
   const ok = await loggedIn();
-  log(ok ? 'Logged in.' : 'Still logged out.');
+  log(ok ? 'Logged in.' : 'WARNING: still logged out – the bot cannot reserve anything until you log in.');
   return ok;
 }
 
@@ -183,8 +212,11 @@ async function latestBookable() {
   const d = await page.evaluate(async ({ API, PARK }) => (await $.ajax({
     url: `${API}?mode=BranchZone&${Date.now()}`, type: 'GET', dataType: 'json', data: { branch_code: PARK },
   })).datelimit, { API, PARK });
-  const [dd, mm, yyyy] = String(d).split('/');
-  return `${yyyy}-${mm}-${dd}`;
+  // Anything else (missing, an error page) must not count as "open": "undefined-…" >= "2026-…" is true.
+  const m = String(d).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) throw new Error(`unexpected date limit from the site: ${JSON.stringify(d)}`);
+  const yyyy = +m[3] > 2400 ? +m[3] - 543 : +m[3];   // Buddhist-era year, just in case
+  return `${yyyy}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
 }
 
 // Same request the red "จอง" button sends (me.Select.LoadHome). Puts the house in the cart.
@@ -229,7 +261,7 @@ log(`Stay ${cfg.check_in} → ${cfg.check_out} (${nights} night${nights > 1 ? 's
 if (mode === 'login') {
   await openReservation();
   if (await ensureLoggedIn()) log('Session saved in .chrome-profile/');
-  await ctx.close(); process.exit(0);
+  await shutdown();
 }
 
 await openReservation();
@@ -241,7 +273,7 @@ if (mode === 'check') {
   log(`Latest bookable check-in today: ${limit} → ${cfg.check_in} is ${limit >= cfg.check_in ? 'OPEN' : 'NOT open yet (houses below are not bookable yet)'}`);
   log('Summit houses free right now (★ = on your list):');
   printHouses(await search());
-  await ctx.close(); process.exit(0);
+  await shutdown();
 }
 
 // Read-only: log how many summit houses are free for check-in DATE around each opening time,
@@ -268,7 +300,7 @@ if (mode === 'watch') {
       await sleep(15000);
     }
   }
-  await ctx.close(); process.exit(0);
+  await shutdown();
 }
 
 // mode === 'run': keep checking from launch until every wanted house is in the cart (or give_up_at).
@@ -292,9 +324,13 @@ async function grab(list) {
     DRY ? 'COMPLETE (dry run – not reserved)' : addToCart(h).catch(e => 'ERROR ' + e.message)));
   fresh.forEach((h, i) => {
     log(`  >>> ${h.name_th}: ${results[i]}`);
-    if (results[i].startsWith('COMPLETE')) { grabbed.push(h); firstGrabAt ||= Date.now(); }
+    if (String(results[i]).startsWith('COMPLETE')) { grabbed.push(h); firstGrabAt ||= Date.now(); }
   });
-  if (results.includes('LOGIN')) { alarm('Booking bot is logged out'); log('LOGGED OUT – log in in the window now!'); await ensureLoggedIn(); }
+  if (results.includes('LOGIN')) {
+    alarm('Booking bot is logged out'); log('LOGGED OUT – log in in the window now!');
+    const ok = await ensureLoggedIn({ fresh: true }).catch(e => (log('  login error:', e.message.split('\n')[0]), false));
+    if (ok) await grab(list);   // retry straight away, don't wait for a search
+  }
 }
 
 let firstGrabAt = 0, lastRefresh = Date.now(), polls = 0, lastFree = -1, isOpen = false, lastLimit = '';
@@ -307,11 +343,14 @@ log(`Every ${cfg.poll_every_seconds}s around ${cfg.open_times.join(' & ')} on ${
 
 while (!done() && Date.now() < giveUp) {
   if (Date.now() - lastRefresh > 10 * 60e3 && !isHot(Date.now())) {   // keep-alive, never during a hot window
-    await openReservation(); if (!DRY) await ensureLoggedIn(); lastRefresh = Date.now(); log('  session refreshed');
+    try { await openReservation(); if (!DRY) await ensureLoggedIn(); log('  session refreshed'); }
+    catch (e) { log('  session refresh error:', e.message.split('\n')[0]); }
+    lastRefresh = Date.now();
   }
   if (!isOpen) {
     let limit = '';
-    try { limit = await latestBookable(); } catch (e) { log('  date check error:', e.message); await sleep(3000); continue; }
+    try { limit = await latestBookable(); }
+    catch (e) { log('  date check error:', e.message.split('\n')[0]); await ensurePageUsable(); await sleep(3000); continue; }
     if (limit >= cfg.check_in) {
       isOpen = true;
       log(`>>> ${cfg.check_in} is now bookable (site limit ${limit}) – reserving!`);
@@ -325,7 +364,8 @@ while (!done() && Date.now() < giveUp) {
     }
   }
   let free = [];
-  try { free = await search(); polls++; } catch (e) { log('  search error:', e.message); await sleep(3000); continue; }
+  try { free = await search(); polls++; }
+  catch (e) { log('  search error:', e.message.split('\n')[0]); await ensurePageUsable(); await sleep(3000); continue; }
   const targets = free.filter(h => wantRank(h) >= 0 && !grabbed.some(g => g.code === h.code))
                       .sort((a, b) => wantRank(a) - wantRank(b));
   if (free.length !== lastFree || targets.length || polls % 30 === 0)
@@ -341,7 +381,7 @@ if (DRY) {
   await sleep(1000);
   await page.screenshot({ path: path.join(DIR, 'dry-run.png') });
   log('Screenshot of the bot window saved to dry-run.png');
-  await ctx.close(); process.exit(0);
+  await shutdown();
 }
 
 if (!grabbed.length) {
@@ -349,10 +389,13 @@ if (!grabbed.length) {
   alarm('Booking bot finished without getting a house');
 } else {
   log(`In cart: ${grabbed.map(h => h.name_th).join(', ')}`);
-  await goToPayment();
+  // A crash here would close Chrome and lose the cart hold, so never let it throw.
+  try { await goToPayment(); }
+  catch (e) { log(`WARNING: could not open the payment form (${e.message.split('\n')[0]}) – open ${SITE}/cart.php in the bot window yourself.`); }
   alarm('Houses are in the cart. Tick the captcha and press save now.');
   log('>>> In the Chrome window: check the details, tick "I\'m not a robot", press บันทึก. The hold lasts ~10 minutes. <<<');
 }
-await rl.question('Press Enter here once you are finished to close the bot window… ');
-await ctx.close();
-process.exit(0);
+// Logged (not just prompted) so the control panel shows it; its prompt text would sit unflushed without a newline.
+log('Press Enter here (or "Done – close bot window" in the control panel) once you are finished to close the bot window.');
+await rl.question('').catch(() => new Promise(() => {}));   // stdin gone: stay open until the window is closed
+await shutdown();
