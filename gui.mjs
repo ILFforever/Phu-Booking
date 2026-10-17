@@ -110,7 +110,7 @@ http.createServer(async (req, res) => {
     }
     if (url.pathname === '/api/start' && req.method === 'POST') {
       const { mode } = await body(req);
-      const modes = { login: ['login'], check: ['check'], dry: ['run', '--dry-run'], run: ['run'] };
+      const modes = { login: ['login'], logout: ['logout'], check: ['check'], dry: ['run', '--dry-run'], run: ['run'] };
       if (!modes[mode]) return send(res, 400, { error: 'unknown mode' });
       startBot(modes[mode][0], modes[mode].slice(1));
       return send(res, 200, { ok: true });
@@ -216,6 +216,7 @@ const PAGE = /* html */ `<!doctype html>
       <button data-mode="check">Check availability</button>
       <button data-mode="dry">Dry run</button>
       <button data-mode="login">Log in</button>
+      <button data-mode="logout">Log out</button>
       <button class="danger" id="stop">■ Stop</button>
       <button id="finish" title="Closes the bot's Chrome window after you have saved the booking">Done – close bot window</button>
       <span id="status"></span>
@@ -278,6 +279,7 @@ $('saveCreds').onclick = async () => {
 };
 document.querySelectorAll('[data-mode]').forEach(b => b.onclick = async () => {
   if (b.dataset.mode === 'run' && !confirm('Start the real bot? It will put houses in your cart when they appear.')) return;
+  if (b.dataset.mode === 'logout' && !confirm('Log out of the booking site? Logging in again needs the reCAPTCHA.')) return;
   $('banner').style.display = 'none';
   const r = await api('/api/start', { mode: b.dataset.mode }); if (r.error) alert(r.error);
 });

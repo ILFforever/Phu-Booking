@@ -1,6 +1,7 @@
 // Phu Kradueng summit-house booking helper for nps.dnp.go.th
 //
 //   node bot.mjs login   – open the bot's Chrome window so you can log in once
+//   node bot.mjs logout  – log out of the site and forget the saved session
 //   node bot.mjs check   – list summit houses free right now for the configured dates
 //   node bot.mjs run     – wait for the booking window, grab houses, stop at the reCAPTCHA
 //
@@ -92,21 +93,49 @@ const wantRank = h => {
 
 // ---------- browser ----------
 const profile = process.argv[2] === 'watch' ? '.chrome-profile-watch' : '.chrome-profile';
+// The site's login cookie only lives while Chrome is open, so every restart used to mean a new reCAPTCHA.
+// Keep a copy of the site's session-only cookies (private, like credentials.json) and put them back at start.
+const SESSION = path.join(DIR, profile === '.chrome-profile' ? '.session.json' : '.session-watch.json');
+let ctx = null;
+async function saveSession() {
+  try {
+    const c = (await ctx.cookies(SITE)).filter(c => c.expires === -1);
+    if (c.length) { fs.writeFileSync(SESSION, JSON.stringify(c), { mode: 0o600 }); fs.chmodSync(SESSION, 0o600); }
+  } catch {}
+}
+
 // Playwright's own SIGTERM/SIGHUP handlers close Chrome but leave this process running (it then loops on
 // "Target page closed" errors), so we handle those signals ourselves: close Chrome, then exit.
-const ctx = await chromium.launchPersistentContext(path.join(DIR, profile), {
-  channel: 'chrome', headless: false, viewport: null, handleSIGTERM: false, handleSIGHUP: false,
-});
-let closing = false;
+// Installed before launch so a Stop during startup can't orphan Chrome (which then locks the profile).
+let closing = false, keepSession = true;
 async function shutdown(code = 0) {
   if (closing) return;
   closing = true;
   setTimeout(() => process.exit(code), 8000).unref();   // Chrome is killed on exit anyway
-  await ctx.close().catch(() => {});
+  if (ctx) { if (keepSession) await saveSession(); await ctx.close().catch(() => {}); }
   process.exit(code);
 }
 process.on('SIGTERM', () => { log('Stopping – closing the bot window.'); shutdown(); });
 process.on('SIGHUP', () => shutdown());
+
+// Starting straight after a Stop can find the old Chrome still closing and holding the profile: wait for it.
+for (let i = 1; ; i++) {
+  try {
+    ctx = await chromium.launchPersistentContext(path.join(DIR, profile), {
+      channel: 'chrome', headless: false, viewport: null, handleSIGTERM: false, handleSIGHUP: false,
+    });
+    break;
+  } catch (e) {
+    if (i >= 10 || !/ProcessSingleton|SingletonLock|has been closed/.test(e.message)) throw e;
+    log(`  the previous bot window is still closing – waiting (${i}/9)`);
+    await sleep(2000);
+  }
+}
+try {
+  const saved = JSON.parse(fs.readFileSync(SESSION, 'utf8'));
+  await ctx.addCookies(saved);
+  log(`Restored the saved login session (${saved.length} cookie${saved.length > 1 ? 's' : ''}).`);
+} catch {}
 
 const page = ctx.pages()[0] || await ctx.newPage();
 panelPage = page;
@@ -133,7 +162,7 @@ async function gotoRetry(url, tries = 5) {
   for (let i = 1; ; i++) {
     try { return await page.goto(url, { waitUntil: 'domcontentloaded' }); }
     catch (e) {
-      if (i >= tries || !/ERR_CERT_|ERR_INTERNET_DISCONNECTED|ERR_NETWORK_CHANGED|ERR_CONNECTION_|ERR_TIMED_OUT/.test(e.message)) throw e;
+      if (i >= tries || !/ERR_ABORTED|ERR_CERT_|ERR_INTERNET_DISCONNECTED|ERR_NETWORK_CHANGED|ERR_CONNECTION_|ERR_TIMED_OUT/.test(e.message)) throw e;
       log(`  page load failed (${e.message.match(/net::\S+/)?.[0] || 'error'}) – retrying in 3 s (${i}/${tries - 1})`);
       await sleep(3000);
     }
@@ -163,34 +192,60 @@ async function loggedIn() {
   }).catch(() => false);
 }
 
-// Fills the login form from credentials, then waits for you to tick the reCAPTCHA
-// (the site keeps the login button disabled until you do) and presses login.
-// fresh: reload first, because the site just said we are logged out and the open page still shows the old menu.
-async function ensureLoggedIn({ fresh = false } = {}) {
-  if (fresh) await openReservation();
-  if (await loggedIn()) return true;
+// One go at the login form: fill it from credentials, wait for you to tick the reCAPTCHA (the site keeps
+// the login button disabled until you do), press login, and wait for the member menu to show your name.
+async function loginOnce() {
   await gotoRetry(`${SITE}/member.php`);
   await dismissPopups();
-  if (creds.id_card) await page.fill('#user_idcard', creds.id_card);
-  if (creds.password) await page.fill('#user_pass', creds.password);
+  if (!await page.$('#user_idcard')) return;   // no login form: probably logged in already; the caller re-checks
+  const auto = !!(creds.id_card && creds.password);
+  if (auto) { await page.fill('#user_idcard', creds.id_card); await page.fill('#user_pass', creds.password); }
   alarm('Booking bot needs you to log in. Tick the captcha.');
-  log(creds.id_card && creds.password
+  log(auto
     ? '>>> LOGIN: tick "I\'m not a robot" in the Chrome window – the bot presses login for you. <<<'
     : '>>> LOGIN: credentials.json is empty – log in by hand in the Chrome window. <<<');
-  try {
-    if (creds.id_card && creds.password) {
-      await page.waitForSelector('#submit:not([disabled])', { timeout: 5 * 60e3 });
-      await page.click('#submit');
+  // The form logs in by ajax (member.script.js me.Login). On COMPLETE the site shows a popup and calls
+  // history.back(), and Chrome restores the previous page from its cache still showing "เข้าสู่ระบบ", so
+  // watching the page never saw the login. Read the site's answer to the login request instead.
+  const answer = page.waitForResponse(r => r.url().includes('mode=Login&'), { timeout: 5 * 60e3 })
+    .then(r => r.json()).catch(() => null);
+  if (auto) {
+    await page.waitForSelector('#submit:not([disabled])', { timeout: 5 * 60e3 })
+      .catch(() => { throw new Error('login not completed within 5 minutes'); });
+    await page.click('#submit');
+  }
+  const r = await answer;
+  if (r?.success === 'COMPLETE') {
+    log('Login accepted by the site.');
+    await sleep(1000);   // let the site's history.back() happen before the caller reloads the page
+  } else {
+    log(r ? `  the site refused the login (${r.success}) – check the ID card/password in credentials.json`
+          : '  no answer to the login – trying again');
+  }
+}
+
+// Never throws: a failed page load or a redirect racing the next page load used to crash the bot right
+// after you had ticked the captcha, and the restart then asked for the captcha again.
+// fresh: reload first, because the site just said we are logged out and the open page still shows the old menu.
+let isLoggedIn = false;
+async function ensureLoggedIn({ fresh = false } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      if (fresh || attempt > 1) await openReservation();
+      if (await loggedIn()) {
+        if (attempt > 1) log('Logged in.');
+        await saveSession();
+        return isLoggedIn = true;
+      }
+      if (attempt > 3) break;
+      await loginOnce();
+    } catch (e) {
+      log(`  login step failed (${e.message.split('\n')[0]}) – trying again`);
+      await sleep(2000);
     }
-    await page.waitForFunction(() => {
-      const t = document.querySelector('#menu_member > a.dropdown-toggle');
-      return t && !/เข้าสู่ระบบ/.test(t.getAttribute('title') + t.innerText);
-    }, null, { timeout: 5 * 60e3 });
-  } catch { log('Login not completed within 5 minutes.'); }
-  await openReservation();
-  const ok = await loggedIn();
-  log(ok ? 'Logged in.' : 'WARNING: still logged out – the bot cannot reserve anything until you log in.');
-  return ok;
+  }
+  log('WARNING: still logged out – the bot cannot reserve anything until you log in.');
+  return isLoggedIn = false;
 }
 
 async function search() {
@@ -258,13 +313,27 @@ function printHouses(list) {
 const mode = process.argv[2] || 'run';
 log(`Stay ${cfg.check_in} → ${cfg.check_out} (${nights} night${nights > 1 ? 's' : ''}). Booking opens ${openDate}.`);
 
+// A failed first load is not fatal: ensureLoggedIn and the run loop reload the page.
+await openReservation().catch(e => log('  page load error:', e.message.split('\n')[0]));
+
 if (mode === 'login') {
-  await openReservation();
-  if (await ensureLoggedIn()) log('Session saved in .chrome-profile/');
+  if (await ensureLoggedIn()) log('Logged in – the session is kept for the next start.');
   await shutdown();
 }
 
-await openReservation();
+if (mode === 'logout') {
+  // The site's own logout (me.Logout in member.script.js), then drop its cookies and our saved copy.
+  const r = await page.evaluate(async () => (await $.ajax({
+    url: `creation/module/member/member.inc.php?mode=Logout&${Date.now()}`, type: 'POST', dataType: 'json', data: {},
+  })).success).catch(e => 'ERROR ' + e.message.split('\n')[0]);
+  keepSession = false;
+  fs.rmSync(SESSION, { force: true });
+  await ctx.clearCookies({ domain: 'nps.dnp.go.th' });
+  await openReservation().catch(() => {});
+  log(await loggedIn() ? `WARNING: still logged in (site answered ${r}).` : `Logged out (site answered ${r}). Saved session deleted.`);
+  await shutdown();
+}
+
 if (mode === 'run' && !DRY) await ensureLoggedIn();
 else if (mode === 'check' && !await loggedIn()) log('WARNING: this window does not look logged in. Run "node bot.mjs login" first.');
 
@@ -342,7 +411,8 @@ log(`Every ${cfg.poll_every_seconds}s around ${cfg.open_times.join(' & ')} on ${
   (DRY ? '  [DRY RUN – nothing will be reserved]' : ''));
 
 while (!done() && Date.now() < giveUp) {
-  if (Date.now() - lastRefresh > 10 * 60e3 && !isHot(Date.now())) {   // keep-alive, never during a hot window
+  // Keep-alive every 10 min, never during a hot window – unless we are logged out, which must be fixed first.
+  if ((Date.now() - lastRefresh > 10 * 60e3 && !isHot(Date.now())) || (!DRY && !isLoggedIn)) {
     try { await openReservation(); if (!DRY) await ensureLoggedIn(); log('  session refreshed'); }
     catch (e) { log('  session refresh error:', e.message.split('\n')[0]); }
     lastRefresh = Date.now();

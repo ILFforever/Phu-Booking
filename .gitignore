@@ -1,5 +1,6 @@
 # private: login details and saved browser sessions
 credentials.json
+.session*.json
 .chrome-profile/
 .chrome-profile-watch/
 
